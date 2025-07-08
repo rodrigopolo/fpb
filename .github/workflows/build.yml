@@ -1,0 +1,164 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  GO_VERSION: '1.21'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+    
+    - name: Run tests
+      run: |
+        go mod download
+        go vet ./...
+        go test -race -coverprofile=coverage.out ./...
+    
+    - name: Upload coverage to Codecov
+      if: github.event_name != 'pull_request'
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.out
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Get dependencies
+      run: go mod download
+
+    - name: Set binary name
+      run: |
+        if [ "${{ matrix.goos }}" = "windows" ]; then
+          echo "BINARY_NAME=fpb-${{ matrix.goos }}-${{ matrix.goarch }}.exe" >> $GITHUB_ENV
+        else
+          echo "BINARY_NAME=fpb-${{ matrix.goos }}-${{ matrix.goarch }}" >> $GITHUB_ENV
+        fi
+
+    - name: Build binary
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+        CGO_ENABLED: 0
+      run: |
+        go build \
+          -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
+          -trimpath \
+          -o ${{ env.BINARY_NAME }} \
+          fpb.go
+
+    - name: Compress binary (Linux/macOS)
+      if: matrix.goos != 'windows'
+      run: |
+        tar -czf ${{ env.BINARY_NAME }}.tar.gz ${{ env.BINARY_NAME }}
+        echo "ARCHIVE_NAME=${{ env.BINARY_NAME }}.tar.gz" >> $GITHUB_ENV
+
+    - name: Compress binary (Windows)
+      if: matrix.goos == 'windows'
+      run: |
+        zip ${{ env.BINARY_NAME }}.zip ${{ env.BINARY_NAME }}
+        echo "ARCHIVE_NAME=${{ env.BINARY_NAME }}.zip" >> $GITHUB_ENV
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: fpb-${{ matrix.goos }}-${{ matrix.goarch }}
+        path: |
+          ${{ env.BINARY_NAME }}
+          ${{ env.ARCHIVE_NAME }}
+
+    - name: Generate SHA256
+      run: |
+        if [ -f "${{ env.ARCHIVE_NAME }}" ]; then
+          sha256sum ${{ env.ARCHIVE_NAME }} > ${{ env.ARCHIVE_NAME }}.sha256
+        fi
+        sha256sum ${{ env.BINARY_NAME }} > ${{ env.BINARY_NAME }}.sha256
+
+    - name: Upload checksums
+      uses: actions/upload-artifact@v3
+      with:
+        name: checksums-${{ matrix.goos }}-${{ matrix.goarch }}
+        path: "*.sha256"
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: ./artifacts
+
+    - name: Prepare release files
+      run: |
+        mkdir -p release
+        # Copy all binaries and archives
+        find ./artifacts -name "fpb-*" -type f -exec cp {} ./release/ \;
+        # Copy all checksums
+        find ./artifacts -name "*.sha256" -type f -exec cp {} ./release/ \;
+        ls -la ./release/
+
+    - name: Generate release notes
+      run: |
+        echo "## 🚀 FFmpeg Progress Bar ${{ github.ref_name }}" > release_notes.md
+        echo "" >> release_notes.md
+        echo "### 📦 Downloads" >> release_notes.md
+        echo "" >> release_notes.md
+        echo "| Platform | Architecture | Download |" >> release_notes.md
+        echo "|----------|--------------|----------|" >> release_notes.md
+        echo "| Linux    | x64         | [fpb-linux-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/fpb-linux-amd64.tar.gz) |" >> release_notes.md
+        echo "| Linux    | ARM64       | [fpb-linux-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/fpb-linux-arm64.tar.gz) |" >> release_notes.md
+        echo "| macOS    | Intel       | [fpb-darwin-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/fpb-darwin-amd64.tar.gz) |" >> release_notes.md
+        echo "| macOS    | Apple Silicon | [fpb-darwin-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/fpb-darwin-arm64.tar.gz) |" >> release_notes.md
+        echo "| Windows  | x64         | [fpb-windows-amd64.exe.zip](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/fpb-windows-amd64.exe.zip) |" >> release_notes.md
+        echo "" >> release_notes.md
+        echo "### ✅ Verification" >> release_notes.md
+        echo "SHA256 checksums are provided for all downloads." >> release_notes.md
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: ./release/*
+        body_path: release_notes.md
+        draft: false
+        prerelease: ${{ contains(github.ref_name, '-') }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
